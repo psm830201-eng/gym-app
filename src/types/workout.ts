@@ -22,6 +22,7 @@ export interface Exercise {
 export interface WorkoutSet {
   id: string;
   weight: number;
+  bodyweight?: boolean;
   reps: number;
   seconds: number;
   doneAt: number | null;
@@ -33,6 +34,8 @@ export interface WorkoutExercise {
   category: Category;
   mode: Mode;
   restSeconds: number;
+  equipment?: Equipment;
+  supersetId?: string;
   sets: WorkoutSet[];
 }
 export interface Day {

@@ -3,8 +3,6 @@ import {
   Activity,
   ArrowDownToLine,
   ArrowRight,
-  ArrowUp,
-  ArrowDown,
   ArrowUpRight,
   Bell,
   Bookmark,
@@ -18,7 +16,6 @@ import {
   Dumbbell,
   FileText,
   Library,
-  Play,
   Plus,
   RotateCcw,
   Settings2,
@@ -30,6 +27,8 @@ import {
 import type { Day, Exercise, Store, WorkoutExercise } from "./types/workout";
 import { Calendar } from "./components/Calendar";
 import { Modal } from "./components/Modal";
+import { NumberInput } from "./components/NumberInput";
+import { WorkoutCard } from "./components/WorkoutCard";
 import { ExerciseLibrary } from "./components/ExerciseLibrary";
 import {
   STORAGE_KEY,
@@ -40,9 +39,9 @@ import {
   emptyDay,
   loadStore,
   makeExercise,
-  newSet,
   parseStore,
-  previousSet,
+  pairExercises,
+  recordSet,
   sessionText,
   shortDate,
   starterRoutine,
@@ -63,14 +62,19 @@ function download(
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 const initial = loadStore();
-type Dialog = "picker" | "save" | "load" | "export" | "settings" | null;
+const initialDate =
+  Object.entries(initial.store.days).find(
+    ([, d]) => d.startedAt && !d.endedAt,
+  )?.[0] ?? dateKey();
+type Dialog =
+  "picker" | "save" | "load" | "export" | "settings" | "superset" | null;
 export default function App() {
   const [store, setStore] = useState<Store>(initial.store),
     storeRef = useRef(store);
   const [saveError, setSaveError] = useState(initial.error),
     [storageAllowed, setStorageAllowed] = useState(!initial.error);
-  const [selected, setSelected] = useState(dateKey()),
-    [month, setMonth] = useState(dateKey().slice(0, 7)),
+  const [selected, setSelected] = useState(initialDate),
+    [month, setMonth] = useState(initialDate.slice(0, 7)),
     [tab, setTab] = useState<"calendar" | "library" | "templates">("calendar");
   const [dialog, setDialog] = useState<Dialog>(null),
     [now, setNow] = useState(Date.now()),
@@ -78,7 +82,8 @@ export default function App() {
     [copiedFrom, setCopiedFrom] = useState(""),
     [toast, setToast] = useState(""),
     [templateName, setTemplateName] = useState(""),
-    [timerNotice, setTimerNotice] = useState(false);
+    [timerNotice, setTimerNotice] = useState(false),
+    [pairSource, setPairSource] = useState<WorkoutExercise | null>(null);
   const audioRef = useRef<AudioContext | null>(null),
     oscillators = useRef<OscillatorNode[]>([]),
     importRef = useRef<HTMLInputElement>(null),
@@ -190,6 +195,8 @@ export default function App() {
     [],
   );
   const startRest = (seconds: number) => {
+    stopSound();
+    setTimerNotice(false);
     if (seconds <= 0) {
       commit((next) => {
         next.rest = null;
@@ -265,63 +272,57 @@ export default function App() {
     });
     notify(`${exercise.name} 추가 완료`);
   };
-  const editExercise = (
-    id: string,
-    change: (exercise: WorkoutExercise) => void,
-  ) => {
-    updateDay((d) => {
-      const e = d.exercises.find((x) => x.id === id);
-      if (e) change(e);
-    });
-  };
-  const startSet = async (id: string) => {
-    if (locked) return;
-    if (activeDate && activeDate !== selected) {
-      notify("진행 중인 다른 날짜의 운동을 먼저 마쳐 주세요.");
-      return;
-    }
-    if (current.activeSetId) {
-      notify("진행 중인 세트를 먼저 완료하거나 취소해 주세요.");
-      return;
-    }
-    await unlockSound();
+  const startSession = () => {
     const latest = storeRef.current.days[selected];
-    const otherActive = Object.entries(storeRef.current.days).some(
-      ([key, d]) => key !== selected && d.startedAt && !d.endedAt,
-    );
-    if (
-      otherActive ||
-      latest?.activeSetId ||
-      latest?.endedAt ||
-      !latest?.exercises.some((e) =>
-        e.sets.some((s) => s.id === id && s.doneAt === null),
-      )
-    )
+    if (!latest?.exercises.length) {
+      notify("운동을 먼저 추가해 주세요.");
       return;
+    }
+    if (latest.startedAt) return;
+    if (
+      Object.entries(storeRef.current.days).some(
+        ([key, d]) => key !== selected && d.startedAt && !d.endedAt,
+      )
+    ) {
+      notify("진행 중인 다른 날짜의 운동을 먼저 종료해 주세요.");
+      return;
+    }
     cancelRest();
     updateDay((d) => {
-      d.startedAt ??= Date.now();
-      d.activeSetId = id;
-    });
-    notify("세트 시작! 운동 후 완료 버튼을 눌러 주세요.");
-  };
-  const completeSet = (exercise: WorkoutExercise, id: string) => {
-    if (current.activeSetId !== id) return;
-    const stamp = Date.now();
-    let finished = false;
-    updateDay((d) => {
-      const e = d.exercises.find((x) => x.id === exercise.id)!;
-      e.sets.find((s) => s.id === id)!.doneAt = stamp;
+      d.startedAt = Date.now();
+      d.endedAt = null;
       d.activeSetId = null;
-      if (d.exercises.every((x) => x.sets.every((s) => s.doneAt !== null))) {
-        d.endedAt = stamp;
-        finished = true;
-      }
     });
-    if (finished) {
-      cancelRest();
-      notify("오늘 운동 완료! 전체 운동시간과 기록을 확인해 보세요.");
-    } else startRest(exercise.restSeconds);
+    void unlockSound();
+    notify("전체 운동 시작! 세트를 마친 뒤 휴식을 눌러 주세요.");
+  };
+  const completeSet = (exercise: WorkoutExercise, index: number) => {
+    try {
+      let result = { rest: false, seconds: 0 };
+      updateDay((d) => {
+        result = recordSet(d, exercise.id, index, Date.now());
+      });
+      if (result.rest) {
+        void unlockSound();
+        startRest(result.seconds);
+      } else {
+        cancelRest();
+        notify(
+          "첫 종목 완료! 같은 라운드의 짝 운동까지 마친 뒤 휴식을 눌러 주세요.",
+        );
+      }
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "세트를 기록하지 못했어요.",
+      );
+    }
+  };
+  const undoSet = (exercise: WorkoutExercise, index: number) => {
+    updateDay((d) => {
+      d.exercises.find((e) => e.id === exercise.id)!.sets[index].doneAt = null;
+    });
+    if (storeRef.current.rest?.date === selected) cancelRest();
+    notify("세트 완료 표시를 취소했어요.");
   };
   const resetDay = () => {
     if (
@@ -343,31 +344,24 @@ export default function App() {
     if (store.rest?.date === selected) cancelRest();
     notify("진행 기록을 초기화했어요.");
   };
-  const finishEarly = () => {
-    if (current.activeSetId) {
-      notify("진행 중인 세트를 완료하거나 취소한 뒤 마쳐 주세요.");
-      return;
-    }
-    const completed = current.exercises
-      .flatMap((e) => e.sets)
-      .flatMap((s) => (s.doneAt === null ? [] : [s.doneAt]));
-    if (!completed.length) {
-      notify(
-        "한 세트 이상 완료한 뒤 마칠 수 있어요. 진행 초기화도 사용할 수 있어요.",
-      );
-      return;
-    }
+  const finishSession = () => {
+    const d = storeRef.current.days[selected];
+    if (!d?.startedAt || d.endedAt) return;
+    const unfinished = totals(d).done < totals(d).count;
     if (
       !confirm(
-        "운동을 여기서 마칠까요? 남은 세트는 미완료로 남고, 마지막 완료 세트 시각으로 운동시간을 저장해요.",
+        unfinished
+          ? "전체 운동을 종료할까요? 남은 세트는 미완료로 보관하고 지금 시각으로 종료해요."
+          : "전체 운동을 종료하고 지금까지의 기록을 저장할까요?",
       )
     )
       return;
-    updateDay((d) => {
-      d.endedAt = Math.max(...completed);
+    updateDay((day) => {
+      day.endedAt = Date.now();
+      day.activeSetId = null;
     });
     cancelRest();
-    notify("운동을 마쳤어요. 미완료 세트도 내보내기에 포함돼요.");
+    notify("전체 운동을 종료하고 운동시간을 저장했어요.");
   };
   const saveTemplate = (event: React.FormEvent) => {
     event.preventDefault();
@@ -837,6 +831,45 @@ export default function App() {
                     </button>
                   )}
                 </div>
+                <div className="session-controls">
+                  {!current.startedAt ? (
+                    <button
+                      className="button primary"
+                      disabled={!current.exercises.length}
+                      onClick={startSession}
+                    >
+                      <Activity size={17} />
+                      전체 운동 시작
+                    </button>
+                  ) : !locked ? (
+                    <>
+                      <span>
+                        <span className="status-dot" />
+                        전체 운동 진행 중
+                      </span>
+                      <button
+                        className="button primary"
+                        onClick={finishSession}
+                      >
+                        <CheckCheck size={17} />
+                        전체 운동 종료
+                      </button>
+                    </>
+                  ) : (
+                    <span>
+                      <CheckCheck size={17} />
+                      종료한 운동 기록
+                    </span>
+                  )}
+                  {current.startedAt &&
+                    !locked &&
+                    t.count > 0 &&
+                    t.done === t.count && (
+                      <small>
+                        모든 세트를 마쳤어요. 전체 운동 종료를 눌러 주세요.
+                      </small>
+                    )}
+                </div>
                 <div className="session-overview">
                   <div>
                     <Timer size={17} />
@@ -901,313 +934,21 @@ export default function App() {
                 ) : (
                   <div className="workout-list">
                     {current.exercises.map((e, ei) => (
-                      <article className="workout-card" key={e.id}>
-                        <div className="workout-title">
-                          <span className="workout-order">
-                            {String(ei + 1).padStart(2, "0")}
-                          </span>
-                          <div>
-                            <h3>{e.name}</h3>
-                            <span>
-                              {e.category} ·{" "}
-                              {e.mode === "time" ? "시간 기록" : "무게 × 횟수"}
-                            </span>
-                          </div>
-                          <div className="exercise-controls">
-                            <button
-                              className="icon-btn"
-                              disabled={
-                                ei === 0 || !!current.activeSetId || locked
-                              }
-                              aria-label={`${e.name} 위로 이동`}
-                              onClick={() =>
-                                updateDay((d) => {
-                                  [d.exercises[ei - 1], d.exercises[ei]] = [
-                                    d.exercises[ei],
-                                    d.exercises[ei - 1],
-                                  ];
-                                })
-                              }
-                            >
-                              <ArrowUp size={15} />
-                            </button>
-                            <button
-                              className="icon-btn"
-                              disabled={
-                                ei === current.exercises.length - 1 ||
-                                !!current.activeSetId ||
-                                locked
-                              }
-                              aria-label={`${e.name} 아래로 이동`}
-                              onClick={() =>
-                                updateDay((d) => {
-                                  [d.exercises[ei + 1], d.exercises[ei]] = [
-                                    d.exercises[ei],
-                                    d.exercises[ei + 1],
-                                  ];
-                                })
-                              }
-                            >
-                              <ArrowDown size={15} />
-                            </button>
-                            <button
-                              className="icon-btn danger"
-                              disabled={
-                                locked ||
-                                e.sets.some(
-                                  (s) =>
-                                    s.doneAt !== null ||
-                                    s.id === current.activeSetId,
-                                )
-                              }
-                              aria-label={`${e.name} 운동 삭제`}
-                              onClick={() => {
-                                if (
-                                  confirm(
-                                    `${e.name} 운동을 이 날짜에서 삭제할까요?`,
-                                  )
-                                )
-                                  updateDay((d) => {
-                                    d.exercises = d.exercises.filter(
-                                      (x) => x.id !== e.id,
-                                    );
-                                  });
-                              }}
-                            >
-                              <X size={17} />
-                            </button>
-                          </div>
-                        </div>
-                        <div className="set-table">
-                          <div
-                            className={`set-header ${e.mode === "time" ? "time-mode" : ""}`}
-                          >
-                            <span>세트</span>
-                            <span>지난 기록</span>
-                            {e.mode === "reps" ? (
-                              <>
-                                <span>kg</span>
-                                <span>횟수</span>
-                              </>
-                            ) : (
-                              <span>시간 (초)</span>
-                            )}
-                            <span>진행</span>
-                            <span />
-                          </div>
-                          {e.sets.map((s, si) => {
-                            const prev = previousSet(
-                                store,
-                                selected,
-                                e.exerciseId,
-                                si,
-                              ),
-                              running = current.activeSetId === s.id,
-                              done = s.doneAt !== null;
-                            return (
-                              <div
-                                className={`set-row ${e.mode === "time" ? "time-mode" : ""} ${done ? "set-done" : ""} ${running ? "set-running" : ""}`}
-                                key={s.id}
-                              >
-                                <span className="set-index">{si + 1}</span>
-                                <span
-                                  className="previous-set"
-                                  title={
-                                    prev
-                                      ? `${prev.date} 기록`
-                                      : "이전 완료 기록 없음"
-                                  }
-                                >
-                                  {prev
-                                    ? e.mode === "time"
-                                      ? `${prev.set.seconds}초`
-                                      : `${prev.set.weight} × ${prev.set.reps}`
-                                    : "—"}
-                                </span>
-                                {e.mode === "reps" ? (
-                                  <>
-                                    <input
-                                      aria-label={`${e.name} ${si + 1}세트 무게`}
-                                      type="number"
-                                      min="0"
-                                      max="2000"
-                                      step="0.5"
-                                      value={s.weight}
-                                      disabled={done || locked}
-                                      onChange={(ev) =>
-                                        editExercise(e.id, (x) => {
-                                          x.sets[si].weight = Math.min(
-                                            2000,
-                                            Math.max(
-                                              0,
-                                              Number(ev.target.value) || 0,
-                                            ),
-                                          );
-                                        })
-                                      }
-                                    />
-                                    <input
-                                      aria-label={`${e.name} ${si + 1}세트 횟수`}
-                                      type="number"
-                                      min="1"
-                                      max="10000"
-                                      step="1"
-                                      value={s.reps}
-                                      disabled={done || locked}
-                                      onChange={(ev) =>
-                                        editExercise(e.id, (x) => {
-                                          x.sets[si].reps = Math.min(
-                                            10000,
-                                            Math.max(
-                                              0,
-                                              Math.floor(
-                                                Number(ev.target.value) || 0,
-                                              ),
-                                            ),
-                                          );
-                                        })
-                                      }
-                                    />
-                                  </>
-                                ) : (
-                                  <input
-                                    aria-label={`${e.name} ${si + 1}세트 시간 초`}
-                                    type="number"
-                                    min="1"
-                                    max="86400"
-                                    step="1"
-                                    value={s.seconds}
-                                    disabled={done || locked}
-                                    onChange={(ev) =>
-                                      editExercise(e.id, (x) => {
-                                        x.sets[si].seconds = Math.min(
-                                          86400,
-                                          Math.max(
-                                            0,
-                                            Math.floor(
-                                              Number(ev.target.value) || 0,
-                                            ),
-                                          ),
-                                        );
-                                      })
-                                    }
-                                  />
-                                )}
-                                <button
-                                  className={`set-status ${done ? "done" : running ? "running" : ""}`}
-                                  disabled={
-                                    locked ||
-                                    (!running && !!current.activeSetId) ||
-                                    (!done &&
-                                      ((e.mode === "reps" && s.reps < 1) ||
-                                        (e.mode === "time" && s.seconds < 1)))
-                                  }
-                                  aria-label={`${e.name} ${si + 1}세트 ${done ? "완료 취소" : running ? "완료" : "시작"}`}
-                                  onClick={() => {
-                                    if (done) {
-                                      editExercise(e.id, (x) => {
-                                        x.sets[si].doneAt = null;
-                                      });
-                                      notify("완료 표시를 취소했어요.");
-                                    } else if (running) completeSet(e, s.id);
-                                    else void startSet(s.id);
-                                  }}
-                                >
-                                  {done ? (
-                                    <Check size={16} />
-                                  ) : running ? (
-                                    <>
-                                      <Check size={13} />
-                                      <span>완료</span>
-                                    </>
-                                  ) : (
-                                    <>
-                                      <Play size={11} />
-                                      <span>시작</span>
-                                    </>
-                                  )}
-                                </button>
-                                <button
-                                  className="remove-set"
-                                  disabled={
-                                    done ||
-                                    running ||
-                                    locked ||
-                                    e.sets.length <= 1
-                                  }
-                                  aria-label={`${e.name} ${si + 1}세트 삭제`}
-                                  onClick={() =>
-                                    editExercise(e.id, (x) => {
-                                      x.sets = x.sets.filter(
-                                        (v) => v.id !== s.id,
-                                      );
-                                    })
-                                  }
-                                >
-                                  <X size={13} />
-                                </button>
-                              </div>
-                            );
-                          })}
-                        </div>
-                        <div className="workout-bottom">
-                          <button
-                            className="add-set"
-                            disabled={locked || e.sets.length >= 50}
-                            onClick={() =>
-                              editExercise(e.id, (x) => {
-                                x.sets.push(newSet(x.sets.at(-1)));
-                              })
-                            }
-                          >
-                            <Plus size={14} />
-                            세트 추가
-                          </button>
-                          <label>
-                            <Timer size={13} />
-                            휴식{" "}
-                            <input
-                              type="number"
-                              min="0"
-                              max="3600"
-                              step="5"
-                              aria-label={`${e.name} 휴식 초`}
-                              disabled={locked}
-                              value={e.restSeconds}
-                              onChange={(ev) =>
-                                editExercise(e.id, (x) => {
-                                  x.restSeconds = Math.min(
-                                    3600,
-                                    Math.max(
-                                      0,
-                                      Math.floor(Number(ev.target.value) || 0),
-                                    ),
-                                  );
-                                })
-                              }
-                            />
-                            초
-                          </label>
-                        </div>
-                        {current.activeSetId &&
-                          e.sets.some((s) => s.id === current.activeSetId) && (
-                            <div className="running-hint">
-                              <span>
-                                <span className="status-dot" />
-                                세트 진행 중 · 마쳤다면 완료를 누르세요.
-                              </span>
-                              <button
-                                onClick={() =>
-                                  updateDay((d) => {
-                                    d.activeSetId = null;
-                                  })
-                                }
-                              >
-                                세트 취소
-                              </button>
-                            </div>
-                          )}
-                      </article>
+                      <WorkoutCard
+                        key={e.id}
+                        exercise={e}
+                        index={ei}
+                        day={current}
+                        store={store}
+                        date={selected}
+                        onChange={updateDay}
+                        onPair={(exercise) => {
+                          setPairSource(exercise);
+                          setDialog("superset");
+                        }}
+                        onRecord={completeSet}
+                        onUndo={undoSet}
+                      />
                     ))}
                   </div>
                 )}
@@ -1226,7 +967,7 @@ export default function App() {
                     <div>
                       <strong>오늘의 운동을 마쳤어요. 수고했어요!</strong>
                       <span>
-                        마지막 세트 완료 시점으로 전체 운동시간을 저장했어요.
+                        전체 운동 종료를 누른 시각으로 운동시간을 저장했어요.
                       </span>
                     </div>
                     <button
@@ -1256,17 +997,8 @@ export default function App() {
                     rows={2}
                   />
                 </div>
-                {current.startedAt && !locked && (
-                  <button
-                    className="finish-session-button"
-                    onClick={finishEarly}
-                  >
-                    <CheckCheck size={16} />
-                    운동 마치기<span>남은 세트는 미완료로 보관</span>
-                  </button>
-                )}
                 <div className="journal-footer">
-                  <span>첫 세트 시작부터 마지막 세트 완료까지 · 휴식 포함</span>
+                  <span>전체 운동 시작부터 전체 운동 종료까지 · 휴식 포함</span>
                   {current.startedAt && (
                     <button onClick={resetDay}>
                       <RotateCcw size={13} />
@@ -1275,11 +1007,11 @@ export default function App() {
                   )}
                 </div>
                 <p className="measurement-note">
-                  맨몸은 0kg, 덤벨은 한 손 무게를 권장해요. 좌우 운동은 한쪽
-                  횟수를 기록하세요.
+                  무게 방식에서 맨몸을 선택할 수 있어요. 덤벨은 한 손 무게를
+                  권장해요. 좌우 운동은 한쪽 횟수를 기록하세요.
                   <br />
-                  시간 종목도 ‘시작 → 완료’를 눌러 기록해요. 입력 시간은
-                  목표이며, 별도 세트 카운트다운은 없어요.
+                  세트를 마치면 ‘휴식’을 누르세요. 슈퍼세트는 두 종목을 마친 뒤
+                  휴식해요. 입력 시간은 목표이며, 별도 세트 카운트다운은 없어요.
                 </p>
               </section>
             </div>
@@ -1353,7 +1085,7 @@ export default function App() {
                 +15초
               </button>
               <button className="timer-skip" onClick={cancelRest}>
-                건너뛰기
+                휴식 종료
               </button>
             </>
           )}
@@ -1370,6 +1102,47 @@ export default function App() {
         <div className="toast" role="status">
           {toast}
         </div>
+      )}
+      {dialog === "superset" && pairSource && (
+        <Modal title="슈퍼세트 지정" onClose={() => setDialog(null)}>
+          <p className="modal-intro">
+            <strong>{pairSource.name}</strong>와 번갈아 할 운동을 선택해 주세요.
+            두 종목은 같은 라운드로 진행하고, 둘 다 마친 뒤 휴식해요. 세트 수는
+            더 많은 쪽에 맞추고 휴식은 첫 운동의 설정을 공유해요.
+          </p>
+          <div className="pair-options">
+            {current.exercises
+              .filter((e) => e.id !== pairSource.id && !e.supersetId)
+              .map((e) => (
+                <button
+                  className="button outline"
+                  key={e.id}
+                  onClick={() => {
+                    try {
+                      updateDay((d) => pairExercises(d, pairSource.id, e.id));
+                      setDialog(null);
+                      notify("두 운동을 슈퍼세트로 연결했어요.");
+                    } catch (error) {
+                      notify(
+                        error instanceof Error
+                          ? error.message
+                          : "슈퍼세트를 만들지 못했어요.",
+                      );
+                    }
+                  }}
+                >
+                  <Dumbbell size={18} />
+                  <span>
+                    {e.name}
+                    <small>
+                      {e.sets.length}세트 · {e.category}
+                    </small>
+                  </span>
+                  <Plus size={16} />
+                </button>
+              ))}
+          </div>
+        </Modal>
       )}
       {dialog === "picker" && (
         <Modal title="운동 추가하기" wide onClose={() => setDialog(null)}>
@@ -1491,9 +1264,8 @@ export default function App() {
                 <small>새로 추가하는 운동에 적용 · 0초는 휴식 없음</small>
               </span>
               <span>
-                <input
+                <NumberInput
                   aria-label="기본 휴식시간 초"
-                  type="number"
                   min="0"
                   max="3600"
                   value={store.settings.restSeconds}

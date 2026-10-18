@@ -22,6 +22,7 @@ export const emptyDay = (): Day => ({
 export const newSet = (previous?: WorkoutSet): WorkoutSet => ({
   id: uid(),
   weight: previous?.weight ?? 0,
+  bodyweight: previous?.bodyweight ?? false,
   reps: previous?.reps ?? 10,
   seconds: previous?.seconds ?? 60,
   doneAt: null,
@@ -35,17 +36,107 @@ export const makeExercise = (
   name: exercise.name,
   category: exercise.category,
   mode: exercise.mode,
+  equipment: exercise.equipment,
   restSeconds: rest,
-  sets: Array.from({ length: exercise.mode === "time" ? 1 : 3 }, () =>
-    newSet(),
-  ),
+  sets: Array.from({ length: exercise.mode === "time" ? 1 : 3 }, () => ({
+    ...newSet(),
+    bodyweight: exercise.equipment === "맨몸" && exercise.mode === "reps",
+  })),
 });
-export const cloneRoutine = (exercises: WorkoutExercise[]): WorkoutExercise[] =>
-  exercises.map((e) => ({
-    ...e,
-    id: uid(),
-    sets: e.sets.map((s) => ({ ...s, id: uid(), doneAt: null })),
-  }));
+export const cloneRoutine = (
+  exercises: WorkoutExercise[],
+): WorkoutExercise[] => {
+  const groups = new Map<string, string>();
+  return exercises.map((e) => {
+    if (e.supersetId && !groups.has(e.supersetId))
+      groups.set(e.supersetId, uid());
+    return {
+      ...e,
+      id: uid(),
+      ...(e.supersetId ? { supersetId: groups.get(e.supersetId) } : {}),
+      sets: e.sets.map((s) => ({ ...s, id: uid(), doneAt: null })),
+    };
+  });
+};
+export const partnerOf = (day: Day, exercise: WorkoutExercise) =>
+  exercise.supersetId
+    ? day.exercises.find(
+        (e) => e.id !== exercise.id && e.supersetId === exercise.supersetId,
+      )
+    : undefined;
+export function pairExercises(day: Day, firstId: string, secondId: string) {
+  const first = day.exercises.find((e) => e.id === firstId),
+    second = day.exercises.find((e) => e.id === secondId);
+  if (
+    !first ||
+    !second ||
+    first === second ||
+    first.supersetId ||
+    second.supersetId ||
+    day.startedAt
+  )
+    throw Error("시작 전의 서로 다른 두 운동을 선택해 주세요.");
+  const count = Math.max(first.sets.length, second.sets.length),
+    group = uid();
+  for (const e of [first, second]) {
+    e.supersetId = group;
+    while (e.sets.length < count) e.sets.push(newSet(e.sets.at(-1)));
+  }
+  const rest = first.restSeconds;
+  second.restSeconds = rest;
+  const items = day.exercises.filter((e) => e.id !== second.id),
+    index = items.findIndex((e) => e.id === first.id);
+  items.splice(index + 1, 0, second);
+  day.exercises = items;
+}
+export function moveExercise(day: Day, id: string, direction: -1 | 1) {
+  const groups: WorkoutExercise[][] = [];
+  for (const e of day.exercises) {
+    const group = e.supersetId
+      ? groups.find((g) => g[0].supersetId === e.supersetId)
+      : undefined;
+    if (group) group.push(e);
+    else groups.push([e]);
+  }
+  const i = groups.findIndex((g) => g.some((e) => e.id === id)),
+    j = i + direction;
+  if (i < 0 || j < 0 || j >= groups.length) return;
+  [groups[i], groups[j]] = [groups[j], groups[i]];
+  day.exercises = groups.flat();
+}
+export function recordSet(
+  day: Day,
+  exerciseId: string,
+  index: number,
+  stamp: number,
+): { rest: boolean; seconds: number } {
+  if (!day.startedAt || day.endedAt)
+    throw Error("전체 운동 시작을 먼저 눌러 주세요.");
+  const exercise = day.exercises.find((e) => e.id === exerciseId),
+    set = exercise?.sets[index];
+  if (!exercise || !set || set.doneAt !== null)
+    throw Error("이미 기록했거나 찾을 수 없는 세트예요.");
+  if (
+    (exercise.mode === "reps" && set.reps < 1) ||
+    (exercise.mode === "time" && set.seconds < 1)
+  )
+    throw Error("횟수 또는 시간을 1 이상 입력해 주세요.");
+  const partner = partnerOf(day, exercise);
+  if (
+    partner &&
+    index > 0 &&
+    !exercise.sets
+      .slice(0, index)
+      .every((s, i) => s.doneAt !== null && partner.sets[i]?.doneAt !== null)
+  )
+    throw Error("이전 슈퍼세트 라운드를 먼저 마쳐 주세요.");
+  set.doneAt = stamp;
+  day.activeSetId = null;
+  return {
+    rest: !partner || partner.sets[index]?.doneAt != null,
+    seconds: exercise.restSeconds,
+  };
+}
 export const totals = (day: Day) => {
   const sets = day.exercises.flatMap((e) => e.sets);
   return {
@@ -58,7 +149,7 @@ export const totals = (day: Day) => {
           v +
           e.sets
             .filter((s) => s.doneAt !== null)
-            .reduce((n, s) => n + s.weight * s.reps, 0),
+            .reduce((n, s) => n + (s.bodyweight ? 0 : s.weight * s.reps), 0),
         0,
       ),
   };
@@ -102,16 +193,23 @@ export function sessionText(key: string, day: Day, now: number): string {
       : []),
     "",
     ...day.exercises.flatMap((e, i) => [
-      `${i + 1}. ${e.name} · ${e.category} · 휴식 ${e.restSeconds}초`,
+      `${i + 1}. ${e.name} · ${e.category} · 휴식 ${e.restSeconds}초${
+        e.supersetId
+          ? ` · 슈퍼세트 (${day.exercises
+              .filter((x) => x.supersetId === e.supersetId)
+              .map((x) => x.name)
+              .join(" + ")})`
+          : ""
+      }`,
       ...e.sets.map(
         (s, j) =>
-          `  ${j + 1}세트: ${e.mode === "time" ? `${s.seconds}초` : `${s.weight}kg × ${s.reps}회`} ${s.doneAt !== null ? "[완료]" : "[미완료]"}`,
+          `  ${j + 1}세트: ${e.mode === "time" ? `${s.seconds}초` : `${s.bodyweight ? "맨몸" : `${s.weight}kg`} × ${s.reps}회`} ${s.doneAt !== null ? "[완료]" : "[미완료]"}`,
       ),
       "",
     ]),
     `메모: ${day.note || "없음"}`,
     "",
-    "※ 운동시간은 첫 세트 시작부터 마지막 세트 완료까지, 휴식을 포함합니다. 덤벨 볼륨은 입력한 무게 기준입니다.",
+    "※ 운동시간은 전체 운동 시작부터 전체 운동 종료까지, 휴식을 포함합니다. 덤벨 볼륨은 입력한 무게 기준입니다.",
   ].join("\n");
 }
 export const previousSet = (
@@ -158,6 +256,11 @@ export function parseStore(raw: string): Store {
         categories.includes(e.category as never) &&
         ["reps", "time"].includes(String(e.mode)) &&
         num(e.restSeconds, 3600) &&
+        (e.equipment === undefined ||
+          ["맨몸", "덤벨", "바벨·머신", "유산소", "기타"].includes(
+            String(e.equipment),
+          )) &&
+        (e.supersetId === undefined || str(e.supersetId)) &&
         Array.isArray(e.sets) &&
         e.sets.length > 0 &&
         e.sets.length <= 50 &&
@@ -166,6 +269,7 @@ export function parseStore(raw: string): Store {
             obj(s) &&
             str(s.id) &&
             num(s.weight, 2000) &&
+            (s.bodyweight === undefined || typeof s.bodyweight === "boolean") &&
             num(s.reps, 10000) &&
             num(s.seconds, 86400) &&
             stamp(s.doneAt),
@@ -261,7 +365,36 @@ export function parseStore(raw: string): Store {
       !validDate(value.rest.date))
   )
     throw Error("휴식 정보가 올바르지 않아요.");
-  return value as unknown as Store;
+  const result = value as unknown as Store;
+  for (const exercises of [
+    ...Object.values(result.days).map((d) => d.exercises),
+    ...result.templates.map((t) => t.exercises),
+  ]) {
+    const groups = new Map<string, WorkoutExercise[]>();
+    for (const e of exercises) {
+      e.equipment ??=
+        catalog.find((c) => c.id === e.exerciseId)?.equipment ??
+        result.customExercises.find((c) => c.id === e.exerciseId)?.equipment ??
+        "기타";
+      for (const s of e.sets)
+        s.bodyweight ??=
+          e.equipment === "맨몸" && e.mode === "reps" && s.weight === 0;
+      if (e.supersetId)
+        groups.set(e.supersetId, [...(groups.get(e.supersetId) || []), e]);
+    }
+    for (const group of groups.values())
+      if (
+        group.length !== 2 ||
+        group[0].sets.length !== group[1].sets.length ||
+        group[0].restSeconds !== group[1].restSeconds
+      )
+        throw Error(
+          "슈퍼세트는 같은 세트 수와 휴식시간을 가진 두 운동으로 구성해야 해요.",
+        );
+  }
+  // Legacy per-set start flags no longer gate the explicit full-session controls.
+  for (const day of Object.values(result.days)) day.activeSetId = null;
+  return result;
 }
 export function loadStore(): { store: Store; error: string | null } {
   try {

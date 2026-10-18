@@ -95,11 +95,21 @@ export function Calendar({
             day = store.days[key],
             t = day ? totals(day) : { count: 0, done: 0 },
             has = t.count > 0;
+          const muscles = Array.from(
+            new Set((day?.exercises ?? []).map((e) => e.category)),
+          ).map((category) => ({
+            category,
+            trained: day.exercises.some(
+              (e) =>
+                e.category === category &&
+                e.sets.some((s) => s.doneAt !== null),
+            ),
+          }));
           return (
             <button
               key={key}
               className={`calendar-day ${selected === key ? "selected" : ""} ${today === key ? "today" : ""} ${has ? "has-workout" : ""}`}
-              aria-label={`${key}${has ? `, ${day.exercises.length}종목 ${t.done}/${t.count}세트` : ", 운동 없음"}`}
+              aria-label={`${key}${muscles.length ? `, ${muscles.map((m) => `${m.category} ${m.trained ? "운동함" : "계획"}`).join(", ")}` : ""}${has ? `, ${day.exercises.length}종목 ${t.done}/${t.count}세트` : ", 운동 없음"}`}
               title={
                 has
                   ? `${day.exercises.map((e) => e.name).join(" · ")} / ${day.endedAt ? "세션 완료" : t.done ? "운동 중" : "계획"}`
@@ -144,6 +154,19 @@ export function Calendar({
                     : `${day.exercises.length}종목`
                   : ""}
               </div>
+              {muscles.length > 0 && (
+                <span className="calendar-muscles">
+                  {muscles.map(({ category, trained }) => (
+                    <span
+                      key={category}
+                      data-category={category}
+                      className={`calendar-muscle ${trained ? "trained" : "planned"}`}
+                    >
+                      {category}
+                    </span>
+                  ))}
+                </span>
+              )}
             </button>
           );
         })}
@@ -162,6 +185,9 @@ export function Calendar({
           완료
         </span>
       </div>
+      <p className="muscle-legend">
+        부위 표시: 채운 색은 운동함 · 테두리는 계획
+      </p>
       <p className="calendar-help">
         <Copy size={14} /> 날짜를 길게 누르면 하루 루틴 복사
       </p>
